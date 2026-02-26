@@ -1,6 +1,8 @@
 import os
 from google import genai
 
+# 모듈 로드 시 클라이언트를 한 번만 초기화합니다.
+# 매 요청마다 새로 만들 필요가 없어서 효율적입니다.
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 PROMPT_TEMPLATE = """
