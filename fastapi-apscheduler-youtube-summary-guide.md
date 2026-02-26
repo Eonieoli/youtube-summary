@@ -476,7 +476,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
+    "gemini-2.5-flash:generateContent"
 )
 
 PROMPT_TEMPLATE = """
