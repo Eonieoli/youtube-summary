@@ -474,20 +474,29 @@ import os
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 사용할 Gemini 모델 및 API 엔드포인트
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.0-flash:generateContent"
 )
 
-# 요약 프롬프트 템플릿
-# {title}과 {transcript}는 실제 값으로 대체됩니다
 PROMPT_TEMPLATE = """
-다음은 유튜브 영상 "{title}"의 자막입니다.
+당신은 유튜브 영상을 분석해 독자에게 영상의 모든 핵심을 전달하는 전문 에디터입니다.
+아래는 영상 "{title}"의 자막 전문입니다.
 
-핵심 내용을 3~5개의 불릿 포인트로 요약해주세요.
-각 항목은 한 줄로 간결하게 작성해주세요.
-독자가 영상을 보지 않아도 핵심을 파악할 수 있도록 구체적으로 작성해주세요.
+이 영상을 보지 않은 사람도 내용을 완전히 이해할 수 있도록 아래 형식으로 작성해주세요.
+
+## 📌 한 줄 요약
+영상 전체를 한 문장으로 압축해주세요.
+
+## 🗂 배경 및 맥락
+이 영상이 다루는 주제의 배경, 사회적/경제적 맥락, 왜 지금 이 주제가 중요한지 설명해주세요. (3~5문장)
+
+## 🔍 핵심 내용
+영상에서 다루는 핵심 논점, 주장, 데이터, 사례를 빠짐없이 정리해주세요.
+각 항목은 소제목과 함께 구체적으로 작성해주세요. (최소 5개 항목)
+
+## 💡 인사이트 및 시사점
+이 영상이 전달하려는 메시지, 시청자가 얻어갈 수 있는 교훈이나 관점을 정리해주세요. (3~5문장)
 
 ---
 {transcript}
@@ -495,15 +504,9 @@ PROMPT_TEMPLATE = """
 
 
 async def summarize(transcript: str, title: str) -> str:
-    """
-    Gemini API를 이용해 자막 텍스트를 불릿 포인트 요약으로 변환합니다.
-    """
-    # 자막이 너무 길면 앞 10,000자만 사용 (Gemini 토큰 한도 대응)
-    # gemini-2.0-flash 기준 입력 토큰 한도는 약 1백만이지만
-    # 무료 플랜에서는 처리 속도와 비용 효율을 위해 제한합니다
-    truncated_transcript = transcript[:10000]
+    # 자막 길이를 20,000자로 확대 (더 풍부한 요약을 위해)
+    truncated_transcript = transcript[:20000]
 
-    # Gemini API 요청 바디 구성
     payload = {
         "contents": [
             {
@@ -518,21 +521,18 @@ async def summarize(transcript: str, title: str) -> str:
             }
         ],
         "generationConfig": {
-            "temperature": 0.3,     # 낮을수록 일관되고 사실적인 응답 (0.0~1.0)
-            "maxOutputTokens": 512, # 요약 결과 최대 토큰 수
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,  # 512 → 2048으로 확대
         },
     }
 
     params = {"key": GEMINI_API_KEY}
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:  # 30 → 60초로 확대
         response = await client.post(GEMINI_URL, json=payload, params=params)
         response.raise_for_status()
 
     data = response.json()
-
-    # Gemini 응답 구조에서 텍스트 추출
-    # data["candidates"][0]["content"]["parts"][0]["text"]
     return data["candidates"][0]["content"]["parts"][0]["text"]
 ```
 
@@ -549,6 +549,7 @@ async def summarize(transcript: str, title: str) -> str:
 ```python
 import smtplib
 import os
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import date
@@ -558,34 +559,87 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
 
+def markdown_to_html(text: str) -> str:
+    """
+    Gemini가 반환하는 마크다운 텍스트를 HTML로 변환합니다.
+    """
+    lines = text.split("\n")
+    html_lines = []
+    in_list = False  # 현재 <ul> 태그가 열려있는지 추적
+
+    for line in lines:
+        # --- 제목 처리 (## 제목) ---
+        if line.startswith("## "):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            content = line[3:].strip()
+            html_lines.append(f'<h3 style="margin: 20px 0 8px; color: #111;">{content}</h3>')
+
+        # --- 불릿 항목 처리 (- 항목 또는 * 항목) ---
+        elif line.startswith("- ") or line.startswith("* "):
+            if not in_list:
+                html_lines.append('<ul style="margin: 8px 0; padding-left: 20px; line-height: 1.9;">')
+                in_list = True
+            content = line[2:].strip()
+            # **굵게** 처리
+            content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', content)
+            html_lines.append(f'<li style="margin-bottom: 6px;">{content}</li>')
+
+        # --- 구분선 (---) ---
+        elif line.strip() == "---":
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+
+        # --- 빈 줄 ---
+        elif line.strip() == "":
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append("")
+
+        # --- 일반 텍스트 ---
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            content = line.strip()
+            # **굵게** 처리
+            content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', content)
+            if content:
+                html_lines.append(f'<p style="margin: 6px 0; line-height: 1.8;">{content}</p>')
+
+    # 마지막에 열린 <ul>이 있으면 닫기
+    if in_list:
+        html_lines.append("</ul>")
+
+    return "\n".join(html_lines)
+
+
 def build_html(results: list[dict]) -> str:
-    """
-    요약 결과 목록을 받아 HTML 이메일 본문을 생성합니다.
-    """
     today = date.today().strftime("%Y년 %m월 %d일")
 
-    # 영상별 HTML 블록 생성
     items_html = ""
     for r in results:
-        # Gemini가 반환한 요약(줄바꿈 포함)을 HTML에서도 줄바꿈이 보이도록 처리
-        summary_html = r["summary"].replace("\n", "<br>")
+        summary_html = markdown_to_html(r["summary"])
         items_html += f"""
         <div style="
-            margin-bottom: 32px;
-            padding: 20px;
-            background: #f9f9f9;
+            margin-bottom: 40px;
+            padding: 24px;
+            background: #fafafa;
             border-left: 4px solid #ff0000;
             border-radius: 4px;
         ">
-            <h3 style="margin: 0 0 6px;">
-                <a href="{r['link']}" style="color: #333; text-decoration: none;">
+            <h3 style="margin: 0 0 6px; font-size: 18px;">
+                <a href="{r['link']}" style="color: #222; text-decoration: none;">
                     {r['title']}
                 </a>
             </h3>
-            <p style="margin: 0 0 12px; color: #888; font-size: 13px;">
+            <p style="margin: 0 0 16px; color: #888; font-size: 13px;">
                 📺 {r['channel']}
             </p>
-            <div style="font-size: 14px; line-height: 1.7; color: #444;">
+            <div style="font-size: 14px; color: #333;">
                 {summary_html}
             </div>
         </div>
@@ -594,40 +648,30 @@ def build_html(results: list[dict]) -> str:
     return f"""
     <html>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                 max-width: 680px; margin: auto; padding: 24px; color: #222;">
+                 max-width: 700px; margin: auto; padding: 24px; color: #222;">
         <h2 style="border-bottom: 2px solid #ff0000; padding-bottom: 12px;">
             📬 오늘의 유튜브 요약 — {today}
         </h2>
-        <p style="color: #666; font-size: 13px;">
+        <p style="color: #666; font-size: 13px; margin-bottom: 32px;">
             총 {len(results)}개 영상의 핵심 내용을 정리했습니다.
         </p>
         {items_html}
         <hr style="border: none; border-top: 1px solid #eee; margin-top: 40px;">
-        <p style="font-size: 11px; color: #aaa; text-align: center;">
-            자동 발송된 이메일입니다.
-        </p>
+        <p style="font-size: 11px; color: #aaa; text-align: center;">자동 발송된 이메일입니다.</p>
     </body>
     </html>
     """
 
 
 async def send_email(results: list[dict]):
-    """
-    Gmail SMTP를 통해 HTML 이메일을 발송합니다.
-    """
     html_content = build_html(results)
 
-    # 이메일 메시지 구성
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📬 유튜브 요약 {date.today().strftime('%m/%d')} ({len(results)}개)"
     msg["From"] = GMAIL_USER
     msg["To"] = RECIPIENT_EMAIL
-
-    # HTML 파트 추가
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-    # Gmail SMTP 서버에 연결하여 발송
-    # SMTP_SSL: 포트 465, TLS 암호화로 처음부터 연결
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
