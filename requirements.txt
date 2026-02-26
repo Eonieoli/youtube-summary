@@ -3,3 +3,4 @@ uvicorn[standard]
 apscheduler
 httpx
 pytz
+google-genai

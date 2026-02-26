@@ -157,6 +157,7 @@ uvicorn[standard]
 apscheduler
 httpx
 pytz
+google-genai
 ```
 
 **각 패키지 역할:**
@@ -469,15 +470,10 @@ async def get_transcript(video_id: str) -> str | None:
 ### 4-7. app/summarize.py
 
 ```python
-import httpx
 import os
+from google import genai
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash-preview-04-17:generateContent"
-)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 PROMPT_TEMPLATE = """
 당신은 유튜브 영상을 분석해 독자에게 영상의 모든 핵심을 전달하는 전문 에디터입니다.
@@ -504,36 +500,19 @@ PROMPT_TEMPLATE = """
 
 
 async def summarize(transcript: str, title: str) -> str:
-    # 자막 길이를 20,000자로 확대 (더 풍부한 요약을 위해)
     truncated_transcript = transcript[:20000]
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": PROMPT_TEMPLATE.format(
-                            title=title,
-                            transcript=truncated_transcript,
-                        )
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 2048,  # 512 → 2048으로 확대
-        },
-    }
+    prompt = PROMPT_TEMPLATE.format(
+        title=title,
+        transcript=truncated_transcript,
+    )
 
-    params = {"key": GEMINI_API_KEY}
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
 
-    async with httpx.AsyncClient(timeout=60) as client:  # 30 → 60초로 확대
-        response = await client.post(GEMINI_URL, json=payload, params=params)
-        response.raise_for_status()
-
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    return response.text
 ```
 
 > 💡 **`temperature`가 뭔가요?**  
