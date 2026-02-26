@@ -1,0 +1,858 @@
+# FastAPI + APScheduler 유튜브 요약 자동화 가이드
+
+> GCP + Docker 서버 설정이 완료된 상태에서 시작하는 가이드  
+> 기술적 원리와 함께 설명하는 단계별 상세 가이드
+
+---
+
+## 목차
+
+1. [전체 구조 이해하기](#1-전체-구조-이해하기)
+2. [프로젝트 파일 구조](#2-프로젝트-파일-구조)
+3. [API 키 발급](#3-api-키-발급)
+4. [파일 작성 - 단계별 상세 설명](#4-파일-작성---단계별-상세-설명)
+   - 4-1. requirements.txt
+   - 4-2. .env
+   - 4-3. app/main.py
+   - 4-4. app/scheduler.py
+   - 4-5. app/youtube.py
+   - 4-6. app/transcript.py
+   - 4-7. app/summarize.py
+   - 4-8. app/mailer.py
+   - 4-9. Dockerfile
+   - 4-10. docker-compose.yml
+5. [배포 및 테스트](#5-배포-및-테스트)
+6. [자주 쓰는 관리 명령어](#6-자주-쓰는-관리-명령어)
+7. [트러블슈팅](#7-트러블슈팅)
+
+---
+
+## 1. 전체 구조 이해하기
+
+### 1-1. 전체 흐름
+
+```
+[APScheduler - 매일 07:00 KST]
+        ↓
+[YouTube Data API v3]
+→ 구독 채널별로 지난 24시간 내 올라온 영상 목록 조회
+        ↓
+[Supadata API]
+→ 각 영상의 자막(스크립트) 텍스트 가져오기
+        ↓
+[Gemini API]
+→ 자막을 읽고 핵심 내용 불릿 요약 생성
+        ↓
+[Gmail SMTP]
+→ 요약 내용을 HTML 이메일로 발송
+```
+
+### 1-2. FastAPI와 APScheduler의 역할 분리
+
+이 프로젝트에서 두 라이브러리는 서로 다른 역할을 맡습니다.
+
+**FastAPI**: 웹 서버 역할입니다. HTTP 요청을 받고 응답을 돌려주는 서버입니다. 여기서는 `/health` (서버 상태 확인)와 `/run-now` (즉시 실행 테스트) 두 개의 엔드포인트만 제공합니다. 백그라운드에서 스케줄러를 "살아있게" 유지하는 껍데기 역할도 합니다.
+
+**APScheduler**: 스케줄러 역할입니다. "매일 오전 7시에 이 함수를 실행해라"는 지시를 등록하고, 시간이 되면 자동으로 실행합니다. cron 표현식을 지원해서 복잡한 스케줄도 설정할 수 있습니다.
+
+> 💡 **왜 FastAPI를 껍데기로 쓰나요?**  
+> APScheduler 단독으로도 스케줄 실행은 가능합니다. 하지만 FastAPI와 함께 쓰면 두 가지 이점이 생깁니다.  
+> 첫 번째, `/run-now` 같은 HTTP 엔드포인트를 열어서 "지금 당장 실행"을 트리거할 수 있어 개발·디버깅이 훨씬 쉽습니다.  
+> 두 번째, `/health` 체크로 서버가 살아있는지 모니터링할 수 있습니다.  
+> Docker가 컨테이너를 띄울 때도 "HTTP 서버가 응답하는가"를 헬스체크 기준으로 쓸 수 있습니다.
+
+### 1-3. n8n과의 1:1 비교
+
+이전에 n8n으로 만들었던 구조와 정확히 대응됩니다.
+
+| n8n 노드 | FastAPI + Python 코드 |
+|---|---|
+| Schedule Trigger | `APScheduler CronTrigger(hour=7, minute=0)` |
+| Code (채널 목록) | `.env`의 `CHANNEL_IDS` 환경 변수 |
+| HTTP Request (YouTube) | `app/youtube.py`의 `get_recent_videos()` 함수 |
+| Filter (24시간 이내) | YouTube API의 `publishedAfter` 파라미터로 서버 측에서 필터링 |
+| HTTP Request (Supadata) | `app/transcript.py`의 `get_transcript()` 함수 |
+| Filter (자막 있음) | `if not transcript: continue` 한 줄 |
+| HTTP Request (Gemini) | `app/summarize.py`의 `summarize()` 함수 |
+| Code (HTML 이메일) + Send Email | `app/mailer.py`의 `build_html()` + `send_email()` 함수 |
+| Loop Over Items | Python `for` 루프 |
+
+---
+
+## 2. 프로젝트 파일 구조
+
+```
+~/youtube-summary/
+├── docker-compose.yml    ← 컨테이너 구성 정의
+├── Dockerfile            ← 이미지 빌드 설계도
+├── requirements.txt      ← Python 패키지 목록
+├── .env                  ← API 키 등 환경 변수 (Git에 올리면 안 됨)
+└── app/
+    ├── main.py           ← FastAPI 앱 + APScheduler 등록
+    ├── scheduler.py      ← 매일 실행되는 메인 파이프라인 로직
+    ├── youtube.py        ← YouTube Data API v3 호출
+    ├── transcript.py     ← Supadata API 호출 (자막 수집)
+    ├── summarize.py      ← Gemini API 호출 (AI 요약)
+    └── mailer.py         ← Gmail SMTP 이메일 발송
+```
+
+각 파일이 하나의 역할만 맡도록 분리하는 이유는 **단일 책임 원칙(Single Responsibility Principle)** 때문입니다. 예를 들어 나중에 Gemini를 다른 AI로 바꾸고 싶다면 `summarize.py`만 수정하면 됩니다. 모든 로직이 하나의 파일에 있으면 수정할 때 다른 기능이 망가질 위험이 커집니다.
+
+---
+
+## 3. API 키 발급
+
+### 3-1. YouTube Data API v3
+
+1. [Google Cloud Console](https://console.cloud.google.com)에 접속합니다.
+2. 좌측 메뉴 `API 및 서비스` → `사용 설정된 API 및 서비스` → **API 및 서비스 사용 설정** 클릭.
+3. 검색창에 `YouTube Data API v3` 검색 → 클릭 → **사용** 클릭.
+4. 좌측 메뉴 `사용자 인증 정보` → **사용자 인증 정보 만들기** → `API 키` 선택.
+5. 생성된 API 키를 복사해 `.env`에 저장합니다.
+
+> 💡 **무료 할당량은 얼마인가요?**  
+> 하루 10,000 units입니다. Search 요청 1회에 100 units가 소모됩니다. 채널 10개 × 하루 1회 조회 = 1,000 units로, 일반적인 개인 사용 기준으로는 절대 초과하지 않습니다.
+
+> 💡 **API 키 보안 설정 (선택 권장)**  
+> 생성된 키를 클릭 → `API 제한` → `YouTube Data API v3`만 선택하면 이 키로 다른 Google API를 호출할 수 없게 됩니다. 키가 유출되더라도 피해 범위를 줄일 수 있습니다.
+
+### 3-2. Supadata API
+
+1. [supadata.ai](https://supadata.ai)에 접속해 회원가입합니다.
+2. 대시보드에서 API Key를 복사합니다.
+3. 무료 플랜 기준 월 100건을 제공합니다. 채널 수와 영상 빈도에 따라 유료 플랜이 필요할 수 있습니다.
+
+> 💡 **Supadata는 왜 필요한가요?**  
+> YouTube의 공식 API에는 자막을 텍스트로 직접 가져오는 엔드포인트가 없습니다. Supadata는 YouTube 영상 ID를 받아서 자막을 파싱해 텍스트로 돌려주는 서드파티 API입니다.
+
+### 3-3. Gemini API
+
+1. [Google AI Studio](https://aistudio.google.com)에 접속합니다.
+2. 좌측 메뉴 `Get API key` → **API 키 만들기** 클릭.
+3. 생성된 키를 복사해 `.env`에 저장합니다.
+
+> 💡 **무료 플랜 한도는?**  
+> `gemini-2.0-flash` 기준 분당 15 요청(RPM), 하루 1,500 요청(RPD)까지 무료입니다. 하루 한 번 수십 건의 요약을 처리하는 정도는 무료 플랜으로 충분합니다.
+
+### 3-4. Gmail 앱 비밀번호
+
+일반 Gmail 비밀번호는 SMTP 접속에 사용할 수 없습니다. "앱 비밀번호"라는 별도의 16자리 비밀번호를 발급해야 합니다.
+
+1. [Google 계정](https://myaccount.google.com) → `보안` 탭으로 이동합니다.
+2. **2단계 인증**이 활성화되어 있어야 합니다. 비활성화 상태라면 먼저 설정하세요.
+3. 검색창에 `앱 비밀번호` 검색 → 앱 이름에 `youtube-summary` 등 임의 이름 입력 → **만들기** 클릭.
+4. 표시된 16자리 비밀번호를 공백 없이 복사해 `.env`에 저장합니다.
+
+> ⚠️ **앱 비밀번호는 한 번만 표시됩니다.** 창을 닫으면 다시 볼 수 없으므로 즉시 `.env`에 저장하세요. 잃어버리면 새로 만들면 됩니다.
+
+---
+
+## 4. 파일 작성 - 단계별 상세 설명
+
+### 4-1. requirements.txt
+
+```txt
+fastapi
+uvicorn[standard]
+apscheduler
+httpx
+pytz
+```
+
+**각 패키지 역할:**
+
+| 패키지 | 역할 |
+|---|---|
+| `fastapi` | 웹 프레임워크. HTTP 서버 및 엔드포인트 제공 |
+| `uvicorn[standard]` | FastAPI를 실제로 실행하는 ASGI 서버. `[standard]`를 붙이면 성능 최적화 패키지(uvloop, httptools)가 함께 설치됨 |
+| `apscheduler` | 스케줄러 라이브러리. cron 방식 등 다양한 스케줄 방식 지원 |
+| `httpx` | 비동기(async) HTTP 요청 라이브러리. 외부 API 호출에 사용 |
+| `pytz` | 타임존 처리 라이브러리. APScheduler의 Asia/Seoul 설정에 필요 |
+
+> 💡 **`httpx`를 쓰는 이유는 뭔가요? `requests`는 안 되나요?**  
+> `requests`는 동기(synchronous) 라이브러리입니다. FastAPI는 비동기(async) 환경으로 동작하는데, 비동기 함수 안에서 동기 HTTP 요청을 하면 다른 요청을 처리하지 못하고 "블로킹" 상태가 됩니다. `httpx`는 `async with`를 지원하는 비동기 클라이언트라서 FastAPI 환경에 적합합니다.
+
+---
+
+### 4-2. .env
+
+```env
+YOUTUBE_API_KEY=여기에_유튜브_API_키_입력
+SUPADATA_API_KEY=여기에_Supadata_API_키_입력
+GEMINI_API_KEY=여기에_Gemini_API_키_입력
+GMAIL_USER=your@gmail.com
+GMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxxxxxx
+RECIPIENT_EMAIL=받을이메일@example.com
+CHANNEL_IDS=UCxxx,UCyyy,UCzzz
+```
+
+**`CHANNEL_IDS` 입력 방법:**
+
+유튜브 채널 ID는 `UC`로 시작하는 24자리 문자열입니다. 여러 채널은 쉼표로 구분합니다.
+
+채널 ID를 찾는 방법:
+- 유튜브 채널 페이지 접속 → 주소창에 `/channel/UCxxx...` 형태라면 그게 채널 ID
+- `@채널명` 형태의 커스텀 URL이라면: 채널 페이지에서 `Ctrl+U`로 소스 보기 → `channelId` 검색
+
+> ⚠️ **`.env` 파일은 Git에 절대 올리면 안 됩니다.** `.gitignore` 파일에 `.env`를 추가해두세요.  
+> API 키가 GitHub에 공개되면 자동 스캐너에 의해 수 분 내에 악용될 수 있습니다.
+
+---
+
+### 4-3. app/main.py
+
+```python
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from app.scheduler import run_daily_summary
+import pytz
+
+# 스케줄러 인스턴스 생성 (타임존을 서울로 고정)
+scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Seoul"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI 서버의 시작과 종료 시점에 실행되는 코드를 정의합니다.
+    with 블록 앞(yield 이전)은 서버 시작 시, 뒤(yield 이후)는 서버 종료 시 실행됩니다.
+    """
+    # --- 서버 시작 시 실행 ---
+    scheduler.add_job(
+        run_daily_summary,                    # 실행할 함수
+        CronTrigger(hour=7, minute=0),        # 매일 07:00 KST
+        id="daily_summary",                   # 잡 식별자 (중복 방지)
+        replace_existing=True,                # 같은 id가 있으면 덮어씀
+    )
+    scheduler.start()
+    print("✅ APScheduler 시작됨. 매일 07:00 KST에 실행됩니다.")
+
+    yield  # ← 이 지점에서 FastAPI 서버가 실제로 실행됨
+
+    # --- 서버 종료 시 실행 ---
+    scheduler.shutdown()
+    print("🛑 APScheduler 종료됨.")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    """서버 상태 확인 엔드포인트"""
+    return {"status": "ok"}
+
+
+@app.post("/run-now")
+async def run_now():
+    """
+    테스트용 즉시 실행 엔드포인트.
+    스케줄 시간을 기다리지 않고 파이프라인을 바로 실행합니다.
+    curl -X POST http://<서버IP>:8000/run-now 으로 호출 가능
+    """
+    await run_daily_summary()
+    return {"status": "done"}
+```
+
+> 💡 **`lifespan`이란?**  
+> FastAPI 서버가 시작될 때(startup)와 종료될 때(shutdown) 실행할 코드를 정의하는 컨텍스트 매니저입니다. 데이터베이스 연결, 스케줄러 시작처럼 서버와 생명 주기를 같이해야 하는 리소스를 여기서 관리합니다. `yield` 앞에 있는 코드가 startup, 뒤가 shutdown입니다.
+
+> 💡 **`AsyncIOScheduler`를 쓰는 이유는?**  
+> APScheduler에는 여러 스케줄러 타입이 있습니다. `BlockingScheduler`는 메인 스레드를 점유해서 FastAPI가 동시에 돌 수 없습니다. `AsyncIOScheduler`는 Python의 asyncio 이벤트 루프 위에서 동작해서 FastAPI와 같은 루프를 공유합니다. 따라서 스케줄러가 실행되는 동안에도 FastAPI는 HTTP 요청을 정상 처리할 수 있습니다.
+
+> 💡 **`/run-now` 엔드포인트가 왜 중요한가요?**  
+> 개발 과정에서 매일 07:00을 기다릴 수는 없습니다. 이 엔드포인트를 호출하면 즉시 전체 파이프라인이 실행되므로, 코드를 수정하고 바로 결과를 확인할 수 있습니다. 실제 서비스 환경에서는 이 엔드포인트를 외부에 노출하지 않도록 나중에 인증을 추가하거나 비활성화할 수 있습니다.
+
+---
+
+### 4-4. app/scheduler.py
+
+```python
+import os
+from app.youtube import get_recent_videos
+from app.transcript import get_transcript
+from app.summarize import summarize
+from app.mailer import send_email
+
+# 환경 변수에서 채널 ID 목록을 읽어옴
+# "UCxxx,UCyyy,UCzzz" → ["UCxxx", "UCyyy", "UCzzz"]
+CHANNEL_IDS = [cid.strip() for cid in os.getenv("CHANNEL_IDS", "").split(",") if cid.strip()]
+
+
+async def run_daily_summary():
+    """
+    매일 실행되는 메인 파이프라인.
+    채널 목록을 순회하며 영상 수집 → 자막 → 요약 → 이메일 발송까지 처리합니다.
+    """
+    print("=" * 40)
+    print("📺 유튜브 요약 파이프라인 시작")
+    print("=" * 40)
+
+    results = []  # 최종 이메일에 담길 요약 결과 목록
+
+    for channel_id in CHANNEL_IDS:
+        print(f"\n📡 채널 처리 중: {channel_id}")
+
+        # 1단계: 해당 채널의 최근 24시간 영상 조회
+        videos = await get_recent_videos(channel_id)
+        print(f"  → 신규 영상 {len(videos)}개 발견")
+
+        if not videos:
+            continue  # 이 채널에 새 영상이 없으면 다음 채널로
+
+        for video in videos:
+            print(f"\n  🎬 처리: {video['title']}")
+
+            # 2단계: 자막 가져오기
+            transcript = await get_transcript(video["video_id"])
+
+            if not transcript:
+                print(f"     → ⚠️ 자막 없음, 스킵")
+                continue  # 자막이 없으면 요약 불가 → 다음 영상으로
+
+            print(f"     → 자막 {len(transcript)}자 수집 완료")
+
+            # 3단계: AI 요약
+            summary = await summarize(transcript, video["title"])
+            print(f"     → 요약 완료")
+
+            # 결과 저장
+            results.append({
+                "title": video["title"],
+                "link": video["link"],
+                "channel": video["channel"],
+                "summary": summary,
+            })
+
+    # 4단계: 이메일 발송
+    print(f"\n📧 총 {len(results)}개 영상 요약 완료")
+
+    if results:
+        await send_email(results)
+        print("✅ 이메일 발송 완료")
+    else:
+        print("ℹ️ 발송할 내용 없음 (오늘 새 영상 없거나 모두 자막 없음)")
+
+    print("=" * 40)
+```
+
+> 💡 **`for channel_id in CHANNEL_IDS:` — n8n의 Loop Over Items와 같습니다.**  
+> n8n에서 채널 목록을 루프 돌리고, 그 안에서 다시 영상 목록을 루프 돌렸던 것을 Python의 중첩 `for` 루프로 표현합니다. 코드가 훨씬 직관적이고, 오류 발생 시 `continue`로 해당 항목만 건너뛰는 처리도 간단합니다.
+
+> 💡 **`if not transcript: continue`가 n8n의 Filter 노드 역할입니다.**  
+> n8n에서 IF 노드로 자막 유무를 확인하고 False 분기는 버렸던 것을 `continue` 한 줄로 처리합니다.
+
+---
+
+### 4-5. app/youtube.py
+
+```python
+import httpx
+import os
+from datetime import datetime, timedelta, timezone
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+
+
+async def get_recent_videos(channel_id: str) -> list[dict]:
+    """
+    주어진 채널 ID에서 최근 24시간 내 업로드된 영상 목록을 반환합니다.
+    
+    반환 형식:
+    [
+        {
+            "video_id": "dQw4w9WgXcQ",
+            "title": "영상 제목",
+            "channel": "채널명",
+            "link": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        },
+        ...
+    ]
+    """
+    # 24시간 전 시각을 RFC 3339 형식으로 계산
+    # YouTube API의 publishedAfter 파라미터는 이 형식을 요구합니다
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+
+    params = {
+        "key": YOUTUBE_API_KEY,
+        "channelId": channel_id,
+        "part": "snippet",          # snippet = 제목, 설명, 채널명 등 기본 정보
+        "order": "date",            # 최신순 정렬
+        "publishedAfter": since,    # 이 시각 이후 업로드된 영상만 조회
+        "maxResults": 5,            # 채널당 최대 5개
+        "type": "video",            # 영상만 (재생목록, 채널 제외)
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(YOUTUBE_SEARCH_URL, params=params)
+        response.raise_for_status()  # HTTP 에러(4xx, 5xx)면 예외 발생
+
+    data = response.json()
+
+    videos = []
+    for item in data.get("items", []):
+        snippet = item["snippet"]
+        video_id = item["id"]["videoId"]
+        videos.append({
+            "video_id": video_id,
+            "title": snippet["title"],
+            "channel": snippet["channelTitle"],
+            "link": f"https://www.youtube.com/watch?v={video_id}",
+        })
+
+    return videos
+```
+
+> 💡 **`publishedAfter`로 서버 측 필터링을 합니다.**  
+> n8n에서는 YouTube API로 영상 목록을 받아온 뒤 별도의 Filter 노드로 24시간 이내 영상을 걸렀습니다. 여기서는 YouTube API 자체에 `publishedAfter` 파라미터를 전달해서, 24시간 내 영상만 처음부터 받아옵니다. 불필요한 데이터를 받지 않으니 더 효율적입니다.
+
+> 💡 **`async with httpx.AsyncClient() as client:`는 무슨 의미인가요?**  
+> `async with`는 비동기 컨텍스트 매니저입니다. 블록이 끝나면 HTTP 연결을 자동으로 정리(close)해줍니다. 수동으로 `client.close()`를 호출할 필요가 없어서 리소스 누수를 방지합니다.
+
+> 💡 **`response.raise_for_status()`는 왜 쓰나요?**  
+> HTTP 응답 코드가 400 이상(에러)이면 자동으로 예외를 발생시킵니다. 이게 없으면 API 키가 잘못되거나 할당량이 초과돼도 코드가 그냥 빈 결과를 돌려주고 지나칩니다. 에러를 즉시 확인하기 위해 넣습니다.
+
+---
+
+### 4-6. app/transcript.py
+
+```python
+import httpx
+import os
+
+SUPADATA_API_KEY = os.getenv("SUPADATA_API_KEY")
+SUPADATA_URL = "https://api.supadata.ai/v1/youtube/transcript"
+
+
+async def get_transcript(video_id: str) -> str | None:
+    """
+    Supadata API를 통해 유튜브 영상의 자막 텍스트를 가져옵니다.
+    자막이 없거나 오류 발생 시 None을 반환합니다.
+    """
+    headers = {"x-api-key": SUPADATA_API_KEY}
+    params = {
+        "videoId": video_id,
+        "lang": "ko",   # 한국어 자막 우선 요청. 없으면 다른 언어도 반환될 수 있음
+        "text": "true", # 타임스탬프 없이 텍스트만 반환
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(SUPADATA_URL, headers=headers, params=params)
+
+    # 자막이 없는 경우 404를 반환하므로, 예외로 처리하지 않고 None 반환
+    if response.status_code == 404:
+        return None
+
+    # 그 외 에러(인증 실패, 서버 오류 등)는 예외 발생
+    if response.status_code != 200:
+        print(f"  Supadata 오류: {response.status_code} - {response.text}")
+        return None
+
+    data = response.json()
+    content = data.get("content", "")
+
+    # content가 빈 문자열이면 None 반환
+    return content if content else None
+```
+
+> 💡 **왜 404를 예외로 처리하지 않고 `None`으로 반환하나요?**  
+> 404는 "자막이 없는 영상"을 의미하는 정상적인 케이스입니다. 예외로 처리하면 스케줄러 전체가 멈출 수 있습니다. 대신 `None`을 반환해서 `scheduler.py`에서 `if not transcript: continue`로 해당 영상만 스킵하게 합니다.
+
+> 💡 **`timeout=20`은 무엇인가요?**  
+> 20초 이내에 응답이 없으면 요청을 포기합니다. 타임아웃이 없으면 외부 API가 응답하지 않을 때 코드가 영원히 기다릴 수 있습니다.
+
+---
+
+### 4-7. app/summarize.py
+
+```python
+import httpx
+import os
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# 사용할 Gemini 모델 및 API 엔드포인트
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
+
+# 요약 프롬프트 템플릿
+# {title}과 {transcript}는 실제 값으로 대체됩니다
+PROMPT_TEMPLATE = """
+다음은 유튜브 영상 "{title}"의 자막입니다.
+
+핵심 내용을 3~5개의 불릿 포인트로 요약해주세요.
+각 항목은 한 줄로 간결하게 작성해주세요.
+독자가 영상을 보지 않아도 핵심을 파악할 수 있도록 구체적으로 작성해주세요.
+
+---
+{transcript}
+"""
+
+
+async def summarize(transcript: str, title: str) -> str:
+    """
+    Gemini API를 이용해 자막 텍스트를 불릿 포인트 요약으로 변환합니다.
+    """
+    # 자막이 너무 길면 앞 10,000자만 사용 (Gemini 토큰 한도 대응)
+    # gemini-2.0-flash 기준 입력 토큰 한도는 약 1백만이지만
+    # 무료 플랜에서는 처리 속도와 비용 효율을 위해 제한합니다
+    truncated_transcript = transcript[:10000]
+
+    # Gemini API 요청 바디 구성
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": PROMPT_TEMPLATE.format(
+                            title=title,
+                            transcript=truncated_transcript,
+                        )
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,     # 낮을수록 일관되고 사실적인 응답 (0.0~1.0)
+            "maxOutputTokens": 512, # 요약 결과 최대 토큰 수
+        },
+    }
+
+    params = {"key": GEMINI_API_KEY}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(GEMINI_URL, json=payload, params=params)
+        response.raise_for_status()
+
+    data = response.json()
+
+    # Gemini 응답 구조에서 텍스트 추출
+    # data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+```
+
+> 💡 **`temperature`가 뭔가요?**  
+> AI 모델의 응답 "창의성/무작위성"을 조절하는 값입니다. 0에 가까울수록 항상 비슷한 답변을 내놓고(사실 전달에 적합), 1에 가까울수록 다양한 표현을 사용합니다. 뉴스/정보 요약은 일관성이 중요하므로 0.3 정도가 적당합니다.
+
+> 💡 **Gemini 응답 구조가 복잡한 이유는?**  
+> Gemini API는 여러 "후보(candidate)" 응답을 동시에 생성할 수 있는 구조로 설계되어 있습니다. 우리는 첫 번째 후보(`[0]`)만 사용합니다. 이 구조를 파악하지 못하면 응답에서 텍스트를 꺼내는 코드를 짜기 어렵습니다.
+
+---
+
+### 4-8. app/mailer.py
+
+```python
+import smtplib
+import os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import date
+
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+
+
+def build_html(results: list[dict]) -> str:
+    """
+    요약 결과 목록을 받아 HTML 이메일 본문을 생성합니다.
+    """
+    today = date.today().strftime("%Y년 %m월 %d일")
+
+    # 영상별 HTML 블록 생성
+    items_html = ""
+    for r in results:
+        # Gemini가 반환한 요약(줄바꿈 포함)을 HTML에서도 줄바꿈이 보이도록 처리
+        summary_html = r["summary"].replace("\n", "<br>")
+        items_html += f"""
+        <div style="
+            margin-bottom: 32px;
+            padding: 20px;
+            background: #f9f9f9;
+            border-left: 4px solid #ff0000;
+            border-radius: 4px;
+        ">
+            <h3 style="margin: 0 0 6px;">
+                <a href="{r['link']}" style="color: #333; text-decoration: none;">
+                    {r['title']}
+                </a>
+            </h3>
+            <p style="margin: 0 0 12px; color: #888; font-size: 13px;">
+                📺 {r['channel']}
+            </p>
+            <div style="font-size: 14px; line-height: 1.7; color: #444;">
+                {summary_html}
+            </div>
+        </div>
+        """
+
+    return f"""
+    <html>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                 max-width: 680px; margin: auto; padding: 24px; color: #222;">
+        <h2 style="border-bottom: 2px solid #ff0000; padding-bottom: 12px;">
+            📬 오늘의 유튜브 요약 — {today}
+        </h2>
+        <p style="color: #666; font-size: 13px;">
+            총 {len(results)}개 영상의 핵심 내용을 정리했습니다.
+        </p>
+        {items_html}
+        <hr style="border: none; border-top: 1px solid #eee; margin-top: 40px;">
+        <p style="font-size: 11px; color: #aaa; text-align: center;">
+            자동 발송된 이메일입니다.
+        </p>
+    </body>
+    </html>
+    """
+
+
+async def send_email(results: list[dict]):
+    """
+    Gmail SMTP를 통해 HTML 이메일을 발송합니다.
+    """
+    html_content = build_html(results)
+
+    # 이메일 메시지 구성
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"📬 유튜브 요약 {date.today().strftime('%m/%d')} ({len(results)}개)"
+    msg["From"] = GMAIL_USER
+    msg["To"] = RECIPIENT_EMAIL
+
+    # HTML 파트 추가
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+    # Gmail SMTP 서버에 연결하여 발송
+    # SMTP_SSL: 포트 465, TLS 암호화로 처음부터 연결
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
+
+    print(f"  → 이메일 발송 완료 (수신: {RECIPIENT_EMAIL})")
+```
+
+> 💡 **`MIMEMultipart("alternative")`가 뭔가요?**  
+> 이메일은 평문(plain text)과 HTML 두 가지 버전을 같이 담을 수 있습니다. `"alternative"`는 "HTML을 지원하는 클라이언트는 HTML로, 아니면 plain text로 보여라"는 의미입니다. 여기서는 HTML만 첨부하지만, 나중에 plain text 버전도 추가할 수 있습니다.
+
+> 💡 **SMTP_SSL 포트 465 vs STARTTLS 포트 587 차이는?**  
+> 포트 465(`SMTP_SSL`)는 처음 연결부터 TLS 암호화로 시작합니다. 포트 587(`SMTP` + `starttls()`)은 일반 연결로 시작해서 중간에 암호화로 업그레이드합니다. Gmail은 둘 다 지원하지만, 465가 더 단순하고 직관적입니다.
+
+---
+
+### 4-9. Dockerfile
+
+서버 설정 가이드에서 작성한 `Dockerfile`에서 변경할 것은 없습니다. 그대로 사용합니다.
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+### 4-10. docker-compose.yml
+
+서버 설정 가이드의 `docker-compose.yml`에서 변경할 것은 없습니다. 그대로 사용합니다.
+
+```yaml
+services:
+  app:
+    build: .
+    container_name: youtube-summary
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Seoul
+    env_file:
+      - .env
+```
+
+> 💡 **`TZ=Asia/Seoul`이 왜 필요한가요?**  
+> Docker 컨테이너는 기본적으로 UTC 타임존을 사용합니다. `TZ=Asia/Seoul`을 설정하면 컨테이너 내부의 시스템 시간이 KST(UTC+9)로 맞춰집니다. APScheduler의 `CronTrigger(hour=7)`이 한국 시간 오전 7시로 동작하게 됩니다.
+
+---
+
+## 5. 배포 및 테스트
+
+### 5-1. 파일 작성
+
+GCP 서버에 SSH로 접속한 후, 각 파일을 작성합니다.
+
+```bash
+# 디렉토리 구조 생성
+mkdir -p ~/youtube-summary/app
+cd ~/youtube-summary
+
+# 각 파일 생성
+nano requirements.txt      # 4-1 내용 입력
+nano .env                  # 4-2 내용 입력 후 API 키 채우기
+nano app/main.py           # 4-3 내용 입력
+nano app/scheduler.py      # 4-4 내용 입력
+nano app/youtube.py        # 4-5 내용 입력
+nano app/transcript.py     # 4-6 내용 입력
+nano app/summarize.py      # 4-7 내용 입력
+nano app/mailer.py         # 4-8 내용 입력
+```
+
+> 💡 **`nano` 사용법:**  
+> 내용 입력 후 `Ctrl+O` → `Enter`(저장), `Ctrl+X`(종료)
+
+### 5-2. 컨테이너 빌드 및 실행
+
+```bash
+cd ~/youtube-summary
+docker compose up -d --build
+```
+
+### 5-3. 헬스 체크
+
+```bash
+curl http://localhost:8000/health
+# 기대 응답: {"status":"ok"}
+```
+
+### 5-4. 즉시 실행 테스트 (핵심!)
+
+스케줄 시간을 기다리지 않고 파이프라인 전체를 즉시 실행합니다.
+
+```bash
+curl -X POST http://localhost:8000/run-now
+```
+
+실행 결과는 로그에서 확인합니다.
+
+```bash
+docker compose logs -f app
+```
+
+아래와 같은 로그가 흘러가면 정상입니다.
+
+```
+✅ APScheduler 시작됨. 매일 07:00 KST에 실행됩니다.
+========================================
+📺 유튜브 요약 파이프라인 시작
+========================================
+
+📡 채널 처리 중: UCxxx...
+  → 신규 영상 2개 발견
+
+  🎬 처리: 영상 제목 예시
+     → 자막 4521자 수집 완료
+     → 요약 완료
+...
+📧 총 3개 영상 요약 완료
+✅ 이메일 발송 완료
+```
+
+### 5-5. 이메일 수신 확인
+
+지정한 `RECIPIENT_EMAIL`로 이메일이 오는지 확인합니다. 스팸함도 확인해보세요.
+
+---
+
+## 6. 자주 쓰는 관리 명령어
+
+```bash
+# 컨테이너 상태 확인
+docker compose ps
+
+# 실시간 로그 보기
+docker compose logs -f app
+
+# 코드 수정 후 재빌드 & 재시작
+docker compose up -d --build
+
+# 컨테이너 재시작 (코드 변경 없이)
+docker compose restart app
+
+# 즉시 실행 (테스트)
+curl -X POST http://localhost:8000/run-now
+
+# 서버 메모리 상태
+free -h
+
+# 디스크 사용량
+df -h
+```
+
+---
+
+## 7. 트러블슈팅
+
+### 빌드 중 오류가 날 때
+
+```bash
+docker compose logs app
+```
+
+로그에서 어떤 패키지 설치가 실패했는지 확인합니다. 메모리 부족이라면 `free -h`로 swap 설정을 확인합니다.
+
+### YouTube API에서 `quotaExceeded` 오류
+
+하루 10,000 units 한도를 초과했습니다. UTC 기준 자정에 초기화됩니다. 채널 수를 줄이거나 `maxResults`를 낮추는 것으로 소모량을 줄일 수 있습니다.
+
+### Gemini API에서 `429 Too Many Requests` 오류
+
+무료 플랜 기준 분당 15 요청 한도를 초과했습니다. 채널 수가 많거나 영상이 몰려있을 때 발생합니다. `summarize.py`의 `async with httpx.AsyncClient()` 호출 전에 `await asyncio.sleep(4)`를 추가해 요청 간격을 조절합니다.
+
+```python
+import asyncio
+
+async def summarize(transcript: str, title: str) -> str:
+    await asyncio.sleep(4)  # 요청 간격 4초 확보
+    ...
+```
+
+### 이메일이 안 올 때
+
+1. Gmail 2단계 인증이 활성화되어 있는지 확인합니다.
+2. 앱 비밀번호에 공백이 없는지 확인합니다. (16자리, 공백 없음)
+3. `.env`의 `GMAIL_USER`와 `GMAIL_APP_PASSWORD`가 정확한지 확인합니다.
+4. Gmail 스팸함을 확인합니다.
+5. `docker compose logs app`에서 SMTP 관련 오류 메시지를 확인합니다.
+
+### 자막이 항상 None으로 반환될 때
+
+1. 해당 영상에 자막이 있는지 YouTube에서 직접 확인합니다. (자막 버튼 클릭)
+2. 한국어 자막이 없는 영상은 `lang` 파라미터를 `en`으로 바꿔보거나 아예 제거해봅니다.
+3. Supadata API 키가 만료되었거나 무료 할당량을 초과했을 수 있습니다.
+
+### 컨테이너가 `run-now` 직후 죽을 때
+
+메모리 부족(OOM)일 가능성이 높습니다. `free -h`로 swap 설정을 확인하고, 가이드의 4-2 Swap 설정 단계를 다시 진행합니다.
+
+---
+
+## 최종 디렉토리 구조 확인
+
+```
+~/youtube-summary/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env                  ← Git에 절대 올리지 않기
+└── app/
+    ├── main.py
+    ├── scheduler.py
+    ├── youtube.py
+    ├── transcript.py
+    ├── summarize.py
+    └── mailer.py
+```
+
+---
+
+*다음 단계: 정상 동작 확인 후 채널 목록 확장 및 요약 프롬프트 커스터마이징*
